@@ -3,15 +3,17 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/esrrhs/gohome/common"
-	"github.com/esrrhs/gohome/geoip"
-	"github.com/esrrhs/gohome/loggo"
-	"github.com/esrrhs/pingtunnel"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"strconv"
 	"time"
+
+	"github.com/esrrhs/gohome/common"
+	"github.com/esrrhs/gohome/geoip"
+	"github.com/esrrhs/gohome/loggo"
+
+	"github.com/esrrhs/pingtunnel"
 )
 
 var usage = `
@@ -214,6 +216,7 @@ func main() {
 			*tcpmode_stat = 0
 		}
 
+		// 过滤器，只支持过滤一个国家，被设置的国家的流量不会走隧道转发
 		if len(*s5filter) > 0 {
 			err := geoip.Load(*s5ftfile)
 			if err != nil {
@@ -221,6 +224,9 @@ func main() {
 				return
 			}
 		}
+
+		// 过滤逻辑，通过 ip 换取服务器的所在地址，判断是否需要转发。
+		// 这个要求判断 ip 的所属国家必须足够准确
 		filter := func(addr string) bool {
 			if len(*s5filter) <= 0 {
 				return true
@@ -259,10 +265,12 @@ func main() {
 		return
 	}
 
+	// 性能测试
 	if *profile > 0 {
 		go http.ListenAndServe("0.0.0.0:"+strconv.Itoa(*profile), nil)
 	}
 
+	// 莫名其妙。client 或者 server 挂了都没法退出主协程
 	for {
 		time.Sleep(time.Hour)
 	}

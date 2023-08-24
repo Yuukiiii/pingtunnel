@@ -1,25 +1,26 @@
 package pingtunnel
 
 import (
+	"net"
+	"sync"
+	"time"
+
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/frame"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/threadpool"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/icmp"
-	"net"
-	"sync"
-	"time"
 )
 
-func NewServer(key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int) (*Server, error) {
+func NewServer(key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connectTimeout int) (*Server, error) {
 	s := &Server{
 		exit:             false,
 		key:              key,
 		maxconn:          maxconn,
 		maxprocessthread: maxprocessthread,
 		maxprocessbuffer: maxprocessbuffer,
-		connecttmeout:    connecttmeout,
+		connectTimeout:   connectTimeout,
 	}
 
 	if maxprocessthread > 0 {
@@ -39,7 +40,7 @@ type Server struct {
 	maxconn          int
 	maxprocessthread int
 	maxprocessbuffer int
-	connecttmeout    int
+	connectTimeout   int
 
 	conn *icmp.PacketConn
 
@@ -74,39 +75,56 @@ type ServerConn struct {
 	echoSeq        int
 }
 
+// Run 启动服务端程序
 func (p *Server) Run() error {
 
+	// 启动 icmp 服务
 	conn, err := icmp.ListenPacket("ip4:icmp", "")
 	if err != nil {
 		loggo.Error("Error listening for ICMP packets: %s", err.Error())
 		return err
 	}
 	p.conn = conn
-
 	recv := make(chan *Packet, 10000)
 	p.recvcontrol = make(chan int, 1)
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv)
+
+	// icmp 数据包 channel
+	go func() {
+		defer common.CrashLog()
+
+		p.workResultLock.Add(1)
+		defer p.workResultLock.Done()
+		recvICMP(&p.exit, *p.conn, recv)
+	}()
 
 	go func() {
+		// statistic 数据统计
 		defer common.CrashLog()
 
 		p.workResultLock.Add(1)
 		defer p.workResultLock.Done()
 
 		for !p.exit {
+			// 关闭并清除超时连接
 			p.checkTimeoutConn()
+			// 统计并打印流量和连接数据
 			p.showNet()
+			// 清除异常连接
 			p.updateConnError()
+			// 每秒执行一次
 			time.Sleep(time.Second)
 		}
 	}()
 
 	go func() {
+		// 处理收到的解析后的 icmp 数据包 Packet
 		defer common.CrashLog()
 
 		p.workResultLock.Add(1)
 		defer p.workResultLock.Done()
 
+		// 控制处理逻辑是否退出，还是轮询退出
+		// exit 也可以搞成 channel，要不然每次循环都要判断，很浪费
 		for !p.exit {
 			select {
 			case <-p.recvcontrol:
@@ -123,6 +141,7 @@ func (p *Server) Run() error {
 func (p *Server) Stop() {
 	p.exit = true
 	p.recvcontrol <- 1
+	// 同时收到 recvcontrol 和 recv，recv 可能会被丢了
 	p.workResultLock.Wait()
 	p.processtp.Stop()
 	p.conn.Close()
@@ -130,10 +149,12 @@ func (p *Server) Stop() {
 
 func (p *Server) processPacket(packet *Packet) {
 
+	// 认证，明文认证，包里的 key 和启动时配置的 key 配的上就行
 	if packet.my.Key != (int32)(p.key) {
 		return
 	}
 
+	// ping 方法，直接返回给客户端
 	if packet.my.Type == (int32)(MyMsg_PING) {
 		t := time.Time{}
 		t.UnmarshalBinary(packet.my.Data)
@@ -145,6 +166,7 @@ func (p *Server) processPacket(packet *Packet) {
 		return
 	}
 
+	// kick 方法，下线操作
 	if packet.my.Type == (int32)(MyMsg_KICK) {
 		localConn := p.getServerConnById(packet.my.Id)
 		if localConn != nil {
@@ -154,6 +176,7 @@ func (p *Server) processPacket(packet *Packet) {
 		return
 	}
 
+	// 处理数据包，如果开了并发就丢到消费队列里，没有开并发就串行处理
 	if p.maxprocessthread > 0 {
 		p.processtp.AddJob((int)(common.HashString(packet.my.Id)), packet)
 	} else {
@@ -161,6 +184,7 @@ func (p *Server) processPacket(packet *Packet) {
 	}
 }
 
+// 为新的 id 创建新的连接
 func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn {
 
 	now := common.GetNowUpdateInSecond()
@@ -168,44 +192,53 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 	loggo.Info("start add new connect  %s %s", id, packet.my.Target)
 
 	if p.maxconn > 0 && p.localConnMapSize >= p.maxconn {
+		// 当设置了最大连接数，且本地已有连接数大于等于最大连接数，选择抛弃新的连接，而不是把旧的连接杀掉，可以考虑用 lru
 		loggo.Info("too many connections %d, server connected target fail %s", p.localConnMapSize, packet.my.Target)
 		p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
 		return nil
 	}
 
 	addr := packet.my.Target
+	// 如果这个地址之前尝试过连接而且还是失败了，会放到 errorConnMap 里，被放进这个 map 里的地址在 5 秒内都不会重新连接，5 秒后才能重新尝试连接
 	if p.isConnError(addr) {
 		loggo.Info("addr connect Error before: %s %s", id, addr)
 		p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
 		return nil
 	}
 
+	// 决定通过什么协议转发是通过数据包里的 TcpMode 定的
 	if packet.my.Tcpmode > 0 {
-
-		c, err := net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
+		// 建立 tcp 连接
+		c, err := net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connectTimeout))
 		if err != nil {
+			// 建立不好，打印日志，返回 icmp 的 kick 消息，把 addr 加到 connErrorMap 里
 			loggo.Error("Error listening for tcp packets: %s %s", id, err.Error())
 			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
 			p.addConnError(addr)
 			return nil
 		}
+		// 拿到 tcp 连接
 		targetConn := c.(*net.TCPConn)
+		// 拿到 tcp 连接地址对象
 		ipaddrTarget := targetConn.RemoteAddr().(*net.TCPAddr)
 
+		// 帧管理器？
 		fm := frame.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, (int)(packet.my.TcpmodeBuffersize), (int)(packet.my.TcpmodeMaxwin), (int)(packet.my.TcpmodeResendTimems), (int)(packet.my.TcpmodeCompress),
 			(int)(packet.my.TcpmodeStat))
 
 		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: targetConn, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
 			rproto: (int)(packet.my.Rproto), fm: fm, tcpmode: (int)(packet.my.Tcpmode)}
 
+		// 连接创建完毕，添加到 map 里
 		p.addServerConn(id, localConn)
 
+		// 启动转发协程，其中会把转为 tcp 包的数据发给实际目的服务器
 		go p.RecvTCP(localConn, id, packet.src)
 		return localConn
 
 	} else {
 
-		c, err := net.DialTimeout("udp", addr, time.Millisecond*time.Duration(p.connecttmeout))
+		c, err := net.DialTimeout("udp", addr, time.Millisecond*time.Duration(p.connectTimeout))
 		if err != nil {
 			loggo.Error("Error listening for udp packets: %s %s", id, err.Error())
 			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
@@ -228,21 +261,23 @@ func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn
 	return nil
 }
 
+// processDataPacket 处理经过 icmp 解包后的数据
 func (p *Server) processDataPacket(packet *Packet) {
 
 	loggo.Debug("processPacket %s %s %d", packet.my.Id, packet.src.String(), len(packet.my.Data))
 
-	now := common.GetNowUpdateInSecond()
-
+	// 每个 id 对应一个连接
 	id := packet.my.Id
 	localConn := p.getServerConnById(id)
 	if localConn == nil {
+		// id 没有对应的连接，要创建新的连接
 		localConn = p.processDataPacketNewConn(id, packet)
 		if localConn == nil {
 			return
 		}
 	}
 
+	now := common.GetNowUpdateInSecond()
 	localConn.activeRecvTime = now
 	localConn.echoId = packet.echoId
 	localConn.echoSeq = packet.echoSeq
@@ -250,20 +285,25 @@ func (p *Server) processDataPacket(packet *Packet) {
 	if packet.my.Type == (int32)(MyMsg_DATA) {
 
 		if packet.my.Tcpmode > 0 {
+			// 转发 tcp 流量
+
 			f := &frame.Frame{}
 			err := proto.Unmarshal(packet.my.Data, f)
+			// tcp protobuf 反序列化失败就关连接
 			if err != nil {
 				loggo.Error("Unmarshal tcp Error %s", err)
 				return
 			}
 
 			localConn.fm.OnRecvFrame(f)
-
 		} else {
+			// 转发 udp 流量
+
 			if packet.my.Data == nil {
 				return
 			}
 			_, err := localConn.conn.Write(packet.my.Data)
+			// udp 写失败就关连接
 			if err != nil {
 				loggo.Info("WriteToUDP Error %s", err)
 				localConn.close = true
@@ -287,11 +327,30 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 
 	loggo.Info("start wait remote connect tcp %s %s", conn.id, conn.tcpaddrTarget.String())
 	startConnectTime := common.GetNowUpdateInSecond()
+	// 有没有建立好连接，没有的话就创建连接，然后把待发送的数据发出去
 	for !p.exit && !conn.exit {
+		// 什么情况下算建立好了？
+		// frame 包里有专门的地方在做 connect 值的切换
+		// 但是初始化的时候并不是 connected
 		if conn.fm.IsConnected() {
 			break
 		}
+		// 实际上 update 里就会设置 isConnected
 		conn.fm.Update()
+		/*
+			func (fm *FrameMgr) GetSendList() *list.List {
+				fm.sendlock.Lock()
+				defer fm.sendlock.Unlock()
+				ret := list.New()
+				for e := fm.sendlist.Front(); e != nil; e = e.Next() {
+					f := e.Value.(*Frame)
+					ret.PushBack(f)
+				}
+				fm.sendlist.Init()
+				return ret
+			}
+		*/
+		// 将 sendlist 里的 frame pop 出来
 		sendlist := conn.fm.GetSendList()
 		for e := sendlist.Front(); e != nil; e = e.Next() {
 			f := e.Value.(*frame.Frame)
@@ -304,6 +363,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 			p.sendPacketSize += (uint64)(len(mb))
 		}
 		time.Sleep(time.Millisecond * 10)
+		// 发送的超时控制，如果超时了，直接关闭连接，返回异常的 icmp 响应
 		now := common.GetNowUpdateInSecond()
 		diffclose := now.Sub(startConnectTime)
 		if diffclose > time.Second*5 {
@@ -323,14 +383,17 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	tcpActiveRecvTime := common.GetNowUpdateInSecond()
 	tcpActiveSendTime := common.GetNowUpdateInSecond()
 
+	// 不停的读取收到的数据
 	for !p.exit && !conn.exit {
 		now := common.GetNowUpdateInSecond()
 		sleep := true
 
 		left := common.MinOfInt(conn.fm.GetSendBufferLeft(), len(bytes))
+		// 每次读的量有个上限
 		if left > 0 {
 			conn.tcpconn.SetReadDeadline(time.Now().Add(time.Millisecond * 1))
 			n, err := conn.tcpconn.Read(bytes[0:left])
+			// 读取异常就关闭 frameMgr
 			if err != nil {
 				nerr, ok := err.(net.Error)
 				if !ok || !nerr.Timeout() {
@@ -498,6 +561,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 	}
 }
 
+// close 关闭连接
 func (p *Server) close(conn *ServerConn) {
 	if p.getServerConnById(conn.id) != nil {
 		conn.exit = true
@@ -511,6 +575,7 @@ func (p *Server) close(conn *ServerConn) {
 	}
 }
 
+// checkTimeoutConn 把超过超时时间的连接关闭，tcpmode 大于 0 的时候不会关闭
 func (p *Server) checkTimeoutConn() {
 
 	tmp := make(map[string]*ServerConn)
@@ -544,6 +609,7 @@ func (p *Server) checkTimeoutConn() {
 	}
 }
 
+// showNet 打印一些网络相关日志，包括每秒发送/接受了多少个包/多少kb的数据以及存在多少个连接。打印完毕后数据会重新计算
 func (p *Server) showNet() {
 	p.localConnMapSize = 0
 	p.localConnMap.Range(func(key, value interface{}) bool {
@@ -594,6 +660,7 @@ func (p *Server) isConnError(addr string) bool {
 	return ok
 }
 
+// updateConnError 将存在于异常连接 map 里超过 5 秒的连接删除，5 秒之后就认为可以重新尝试了
 func (p *Server) updateConnError() {
 
 	tmp := make(map[string]time.Time)

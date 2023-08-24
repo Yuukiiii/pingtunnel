@@ -1,18 +1,19 @@
 package pingtunnel
 
 import (
-	"github.com/esrrhs/gohome/common"
-	"github.com/esrrhs/gohome/frame"
-	"github.com/esrrhs/gohome/loggo"
-	"github.com/esrrhs/gohome/network"
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/icmp"
 	"io"
 	"math"
 	"math/rand"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/esrrhs/gohome/common"
+	"github.com/esrrhs/gohome/frame"
+	"github.com/esrrhs/gohome/loggo"
+	"github.com/esrrhs/gohome/network"
+	"github.com/golang/protobuf/proto"
+	"golang.org/x/net/icmp"
 )
 
 const (
@@ -215,7 +216,15 @@ func (p *Client) Run() error {
 
 	recv := make(chan *Packet, 10000)
 	p.recvcontrol = make(chan int, 1)
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv)
+
+	// icmp 数据包 channel
+	go func() {
+		defer common.CrashLog()
+
+		p.workResultLock.Add(1)
+		defer p.workResultLock.Done()
+		recvICMP(&p.exit, *p.conn, recv)
+	}()
 
 	go func() {
 		defer common.CrashLog()

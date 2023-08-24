@@ -2,16 +2,16 @@ package pingtunnel
 
 import (
 	"encoding/binary"
-	"github.com/esrrhs/gohome/common"
+	"net"
+	"time"
+
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"net"
-	"sync"
-	"time"
 )
 
+// sendICMP 封装并发送 icmp 包
 func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, target string,
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
@@ -61,14 +61,10 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	conn.WriteTo(bytes, server)
 }
 
-func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet) {
-
-	defer common.CrashLog()
-
-	(*workResultLock).Add(1)
-	defer (*workResultLock).Done()
-
+// recvICMP 解析 icmp 数据包的方法
+func recvICMP(exit *bool, conn icmp.PacketConn, recv chan<- *Packet) {
 	bytes := make([]byte, 10240)
+	// 只要服务器没有停就要不断从 icmp 隧道里读数据，每次读指定大小
 	for !*exit {
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 		n, srcaddr, err := conn.ReadFrom(bytes)
@@ -85,9 +81,11 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 			continue
 		}
 
+		// icmp 数据包前 4 个字节是 icmp 头部，包括 Type，Code，Sum，不用处理
 		echoId := int(binary.BigEndian.Uint16(bytes[4:6]))
 		echoSeq := int(binary.BigEndian.Uint16(bytes[6:8]))
 
+		// 第 8 个字节往后是真实数据包，pb格式
 		my := &MyMsg{}
 		err = proto.Unmarshal(bytes[8:n], my)
 		if err != nil {
@@ -95,11 +93,13 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 			continue
 		}
 
+		// magic 值不对，就不是好包
 		if my.Magic != (int32)(MyMsg_MAGIC) {
 			loggo.Debug("processPacket data invalid %s", my.Id)
 			continue
 		}
 
+		// 把解析后的 Packet 丢到 channel 里
 		recv <- &Packet{my: my,
 			src:    srcaddr.(*net.IPAddr),
 			echoId: echoId, echoSeq: echoSeq}
